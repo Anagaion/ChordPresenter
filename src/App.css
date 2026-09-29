@@ -687,3 +687,10 @@ body { background: var(--bg); color: var(--text); overflow-y: auto; }
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+/* ── Paste mode ── */
+.paste-meta { display: flex; gap: 10px; }
+.paste-meta .url-input { flex: 1; }
+.paste-textarea { min-height: 260px; }
+.paste-use-btn { margin-top: 10px; align-self: flex-end; }
+.paste-label-row { display: flex; justify-content: space-between; align-items: center; }

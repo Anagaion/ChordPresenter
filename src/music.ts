@@ -1,15 +1,71 @@
 // ── Keys, capo, and transposition ────────────────────────────────────────────
+import grammar from "../scripts/chord_grammar.json" with { type: "json" };
+
 // Mirrors the Python engine in scripts/md_to_pro.py (_detect_key,
 // _detect_chart_key, shift_key, _key_idx, transpose_chord) so the key the UI
 // shows, the chart it previews/prints, and the .pro it exports always agree.
 
-const CHORD_TOKEN = /^[A-G][#b]?(m(?!aj|in)|maj|min|dim|aug|°|ø)?(7|9|11|13|6|5|4|2)?(sus[24]?|add[29]?)?(\/?[A-G][#b]?)?$/;
+// ── Chord grammar (shared with scripts/md_to_pro.py via chord_grammar.json) ──
+// A chord is ROOT + quality + an extension known for that quality
+// (+ bracketed additions like "(sus4)", "(b9)") + optional "/BASS".
+// Same regex construction as md_to_pro.py — edit the JSON, not this code.
 
-// Same grammar as md_to_pro.py's _CHORD_TOKEN_RE, split into root / quality / bass.
-const CHORD_PARTS = /^([A-G][#b]?)((?:m|maj|min|M|dim|aug|°|ø)?(?:maj|min)?(?:7|9|11|13|6|5|4|2)?(?:sus[24]?|add[29]?|omit[35]?)?)(?:\/([A-G][#b]?))?$/;
+const FAMILIES = ["minor", "augmented", "diminished", "half_diminished", "major"] as const;
+type ChordFamily = typeof FAMILIES[number];
 
-// Non-chord tokens allowed on a chord line: bars, dashes, repeat marks.
-const CHORD_LINE_FILLER = /^(\|+|-+|\/|%|\.+|x\d+|\d+x|\(x?\d+x?\)|N\.?C\.?)$/i;
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const alt = (items: string[], escape = true) =>
+  [...items].sort((a, b) => b.length - a.length).map(i => (escape ? escapeRe(i) : i)).join("|");
+
+const ROOT = `(?:${alt(grammar.roots)})`;
+const QUALITY_BRANCHES = FAMILIES.map(fam =>
+  `(?<q_${fam}>${alt(grammar.qualities[fam])})(?:${alt(grammar.extensions[fam])})`).join("|");
+const BRACKETED = `(?:\\((?:${alt(grammar.bracketed_additions, false)})\\))*`;
+const CHORD_RE = new RegExp(`^(?<root>${ROOT})(?:${QUALITY_BRANCHES})${BRACKETED}(?:/(?<bass>${ROOT}))?$`);
+const NO_CHORD = new Set(grammar.no_chord);
+
+// Non-chord tokens allowed on a chord line: bars, dashes, slashes (strum
+// marks), dots, repeat marks. Same set as _FILLER_RE in md_to_pro.py.
+const FILLER = /^(-+|\/+|\.+|%|\*+|x\d+|\d+x|\(x?\d+x?\))$/i;
+
+/** Chord family of a token, "no_chord" for N.C., or null if not a chord. */
+export function chordQuality(tok: string): ChordFamily | "no_chord" | null {
+  if (NO_CHORD.has(tok)) return "no_chord";
+  // A bare trailing dash is a connector ("C-Bb-Ab" walks down), not minor;
+  // "-" means minor only with something after it ("C-7", "C-9").
+  if (/^[A-G][#b]?-+(\/|$)/.test(tok)) return null;
+  const g = tok.match(CHORD_RE)?.groups;
+  if (!g) return null;
+  return FAMILIES.find(fam => g[`q_${fam}`] !== undefined) ?? null;
+}
+
+export const isChordToken = (tok: string) => chordQuality(tok) !== null;
+
+/** Read a line as a chord line: [{col, chord}] if every piece is a chord or
+ *  filler (and there's at least one chord), else null. Mirrors
+ *  md_to_pro.scan_chord_line: "|" separates, "(G)"/"G*" unwrap, "G-D" splits
+ *  at dashes unless the whole token is a chord ("C-7" = C minor 7). */
+export function scanChordLine(line: string): { col: number; chord: string }[] | null {
+  const found: { col: number; chord: string }[] = [];
+  for (const m of line.matchAll(/[^\s|]+/g)) {
+    const tok = m[0];
+    let col = m.index!;
+    if (FILLER.test(tok)) continue;
+    let core = tok.replace(/\*+$/, "");
+    if (core.startsWith("(")) { core = core.slice(1); col += 1; }
+    const opens = (core.match(/\(/g) || []).length;
+    const closes = (core.match(/\)/g) || []).length;
+    if (core.endsWith(")") && closes > opens) core = core.slice(0, -1);
+    if (isChordToken(core)) { found.push({ col, chord: core }); continue; }
+    const parts = [...core.matchAll(/[^-]+/g)];
+    if (parts.length && parts.every(p => isChordToken(p[0]))) {
+      parts.forEach(p => found.push({ col: col + p.index!, chord: p[0] }));
+      continue;
+    }
+    return null;
+  }
+  return found.length ? found : null;
+}
 
 const ENH: Record<string, string> = {
   'C#':'Db','Db':'C#','D#':'Eb','Eb':'D#',
@@ -85,31 +141,29 @@ export function prefersFlats(key: string): boolean {
 }
 
 export function transposeChord(chord: string, semitones: number, preferFlat: boolean): string {
-  if (!semitones) return chord;
-  const m = chord.match(CHORD_PARTS);
+  if (!semitones || !isChordToken(chord) || NO_CHORD.has(chord)) return chord;
+  const m = chord.match(/^([A-G][#b]?)(.*?)(?:\/([A-G][#b]?))?$/);
   if (!m) return chord;
   const names = preferFlat ? FLATS : SHARPS;
-  const move = (n: string) => names[(noteIdx(n) + semitones) % 12];
+  const move = (n: string) => { try { return names[(noteIdx(n) + semitones) % 12]; } catch { return n; } };
   const [, root, quality, bass] = m;
   return move(root) + quality + (bass ? "/" + move(bass) : "");
 }
 
-/** Strip wrapping punctuation a chord can carry on a chord line: "(G)", "G*". */
-function splitToken(tok: string): [string, string, string] {
-  const m = tok.match(/^(\(?)(.*?)(\)?\*?)$/);
-  return m ? [m[1], m[2], m[3]] : ["", tok, ""];
+export function isChordLine(line: string): boolean {
+  return scanChordLine(line.trim()) !== null;
 }
 
-export function isChordLine(line: string): boolean {
-  const tokens = line.trim().split(/\s+/).filter(Boolean);
-  let chords = 0;
-  for (const tok of tokens) {
-    const [, core] = splitToken(tok);
-    if (CHORD_PARTS.test(core)) { chords++; continue; }
-    if (CHORD_LINE_FILLER.test(tok)) continue;
-    return false;
+/** Shrink runs of 2+ spaces in `gap` by up to `drift` characters (last run
+ *  first), so text after it moves back toward its original column. */
+function absorbDrift(gap: string, drift: number): string {
+  while (drift > 0) {
+    const i = gap.search(/ {2,}(?=[^ ]*$)/);
+    if (i < 0) break;
+    gap = gap.slice(0, i) + gap.slice(i + 1);
+    drift--;
   }
-  return chords > 0;
+  return gap;
 }
 
 /** Transpose every chord line in a chart, keeping each chord at its original
@@ -118,17 +172,17 @@ export function isChordLine(line: string): boolean {
 export function transposeChart(chart: string, semitones: number, preferFlat: boolean): string {
   if (!semitones) return chart;
   return chart.split("\n").map(line => {
-    if (!isChordLine(line)) return line;
-    let out = "";
-    for (const m of line.matchAll(/\S+/g)) {
-      const [pre, core, post] = splitToken(m[0]);
-      const tok = CHORD_PARTS.test(core)
-        ? pre + transposeChord(core, semitones, preferFlat) + post
-        : m[0];
-      const col = out.length === 0 ? m.index! : Math.max(m.index!, out.length + 1);
-      out = out.padEnd(col) + tok;
+    const pieces = scanChordLine(line);
+    if (!pieces) return line;
+    // Copy the line, swapping each chord in place. When a chord gets longer
+    // (G → Ab) the spaces after it absorb the difference, so later chords keep
+    // their column; bars, brackets and at least one space are kept.
+    let out = "", last = 0;
+    for (const { col, chord } of pieces) {
+      out += absorbDrift(line.slice(last, col), out.length - last) + transposeChord(chord, semitones, preferFlat);
+      last = col + chord.length;
     }
-    return out;
+    return out + line.slice(last);
   }).join("\n");
 }
 
@@ -186,15 +240,12 @@ const DIATONIC_CHORDS: Record<string, Set<string>> = {
   Bbm: new Set(['Bbm','Db','Ebm','Fm','F','Gb','Ab']),
 };
 
-/** Reduce chord to root + 'm' if minor, else just root.
- *  Strips slash bass, extensions, and quality suffixes. */
+/** Reduce chord to root + 'm' if minor (m, mi, min, -), else just root. */
 function normChord(chord: string): string {
-  const noSlash = chord.split('/')[0];
-  const m = noSlash.match(/^([A-G][#b]?)(.*)/);
-  if (!m) return '';
-  const [, root, quality] = m;
-  const isMinor = /^m(?!aj)/.test(quality);
-  return root + (isMinor ? 'm' : '');
+  const fam = chordQuality(chord);
+  const root = chord.match(/^[A-G][#b]?/)?.[0];
+  if (!root || fam === null || fam === "no_chord") return "";
+  return root + (fam === "minor" ? "m" : "");
 }
 
 function chordVariants(norm: string): string[] {
@@ -227,12 +278,10 @@ function keyFromChords(normChords: string[]): string {
 function keyFromBody(body: string): string {
   const normChords: string[] = [];
   for (const line of body.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    // Drop slash bass notes first so "B/D#" scores only as B.
-    const tokens = trimmed.replace(/\/[A-G][#b]?/g, "").replace(/[|\-.]/g, " ").split(/\s+/).filter(Boolean);
-    if (tokens.length > 0 && tokens.every(t => CHORD_TOKEN.test(t))) {
-      tokens.forEach(t => { const n = normChord(t); if (n) normChords.push(n); });
+    // Slash bass notes don't count, so "B/D#" scores only as B.
+    for (const { chord } of scanChordLine(line.trim()) ?? []) {
+      const n = normChord(chord.split("/")[0]);
+      if (n) normChords.push(n);
     }
   }
   return keyFromChords(normChords);
@@ -260,11 +309,16 @@ export interface KeyInfo {
  *
  * @param content  whole .md file or chart text (Key:/Capo: lines are read from it)
  * @param body     just the chord chart (for chord-based detection)
+ * @param siteCapo capo the site reported (undefined = site doesn't report one)
  */
-export function analyzeKey(content: string, body: string, siteKey = "", siteCapo = 0): KeyInfo {
+export function analyzeKey(content: string, body: string, siteKey = "", siteCapo?: number): KeyInfo {
   const keyLine = content.match(KEY_LINE_RE);
   const labelled = canonicalKey(siteKey || (keyLine ? keyLine[1] + (keyLine[2] || "") : ""));
-  const capo = siteCapo > 0 && siteCapo < 12 ? siteCapo : detectCapo(content);
+  // A site that reports its capo (UG, WorshipChords.com) is trusted even when
+  // it says 0; only when it doesn't say do we look for "Capo N" in the text.
+  const capo = siteCapo !== undefined
+    ? (siteCapo > 0 && siteCapo < 12 ? siteCapo : 0)
+    : detectCapo(content);
   const chordKey = keyFromBody(body);
 
   if (labelled && capo) {

@@ -4,7 +4,7 @@ ew_fetch.py — Universal chord chart fetcher → ProPresenter .pro converter.
 
 Supports:
   EssentialWorship, WorshipTogether, WorshipChords.com, WorshipChords.net,
-  E-Chords, Ultimate Guitar, and a generic fallback for unknown sites.
+  Ultimate Guitar, and a generic fallback for unknown sites.
 
 Usage:
   # Preview mode — outputs JSON for the ChordPresenter UI:
@@ -28,6 +28,9 @@ import os
 import tempfile
 import subprocess
 import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import md_to_pro  # key detection helpers, shared with the .pro builder
 from html.parser import HTMLParser
 
 
@@ -80,7 +83,9 @@ def convert_chart_to_md(chart_text: str, title: str, artist: str) -> str:
     converted = [l for l in converted
                  if 'Chord chart and lyrics provided by' not in l]
 
-    chart_body = '\n'.join(converted).strip()
+    # Trim blank lines at the edges only — keep the first line's indentation
+    # (an indented chord line's leading spaces are its chord positions).
+    chart_body = re.sub(r'^(?:[ \t]*\n)+', '', '\n'.join(converted)).rstrip()
 
     title_esc  = title.replace('"', '\\"')
     artist_esc = artist.replace('"', '\\"')
@@ -117,6 +122,20 @@ def fetch_html(url: str) -> str:
 
 # ── Site detection ─────────────────────────────────────────────────────────────
 
+# Sites we deliberately don't parse. Checked before fetching so the user gets
+# a clear reason instead of a raw HTTP error or a half-parsed page.
+UNSUPPORTED_SITES = {
+    'e-chords.com': 'E-Chords isn\'t supported — the site blocks automated requests. '
+                    'Try the same song on Ultimate Guitar, WorshipTogether, or WorshipChords.',
+}
+
+def unsupported_reason(url: str) -> str | None:
+    url_lower = url.lower()
+    for domain, reason in UNSUPPORTED_SITES.items():
+        if domain in url_lower:
+            return reason
+    return None
+
 def detect_site(url: str) -> str:
     url_lower = url.lower()
     if 'essentialworship.com' in url_lower:       return 'essentialworship'
@@ -125,7 +144,6 @@ def detect_site(url: str) -> str:
     if 'worshipchords.com' in url_lower:          return 'worshipchords_com'
     if 'ultimate-guitar.com' in url_lower:        return 'ultimate_guitar'
     if 'tabs.ultimate-guitar.com' in url_lower:  return 'ultimate_guitar'
-    if 'e-chords.com' in url_lower:              return 'echords'
     if 'genius.com' in url_lower:                return 'genius'
     if 'allchristiansongslyrics.com' in url_lower: return 'lyrics_generic'
     if 'azlyrics.com' in url_lower:              return 'lyrics_generic'
@@ -399,114 +417,6 @@ def parse_worshiptogether(html: str) -> dict:
     }
 
 
-# ── E-Chords ───────────────────────────────────────────────────────────────────
-
-# E-Chords uses XML-like section tags inside the <pre> block:
-#   <V1>...</V1>  Verse 1      <V2> Verse 2 ...
-#   <R>...</R>    Refrain/Chorus
-#   <PR>...</PR>  Pre-Refrain/Pre-Chorus
-#   <PONTE>       Bridge  (ponte = bridge in Portuguese)
-#   <INTRO>       Intro
-#   <i>NAME:</i>  Section header (sometimes used at start)
-_ECHORDS_TAG_MAP = {
-    'V':     'VERSE',
-    'R':     'CHORUS',
-    'PR':    'PRE-CHORUS',
-    'PONTE': 'BRIDGE',
-    'INTRO': 'INTRO',
-    'I':     'INTRO',
-    'OUT':   'OUTRO',
-    'O':     'OUTRO',
-    'C':     'CHORUS',
-    'CODA':  'CODA',
-    'B':     'BRIDGE',
-    'SOLO':  'INTERLUDE',
-}
-
-
-def _echords_section_tag(tag_name: str) -> str | None:
-    """Convert an E-Chords section tag name to a [BRACKET] header, or None."""
-    tag_up = tag_name.upper()
-    # Check full name first
-    if tag_up in _ECHORDS_TAG_MAP:
-        return f'[{_ECHORDS_TAG_MAP[tag_up]}]'
-    # Check V1, V2, R2 etc.
-    m = re.match(r'^(V|R|PR|B|C|I|O)(\d+)$', tag_up)
-    if m:
-        base, num = m.group(1), m.group(2)
-        name = _ECHORDS_TAG_MAP.get(base, base)
-        return f'[{name} {num}]' if name not in ('CHORUS', 'PRE-CHORUS', 'BRIDGE') else f'[{name}]'
-    return None
-
-
-def parse_echords(html: str) -> dict:
-    """
-    E-Chords embeds the chord chart in a <pre> block with:
-      <span data-chord="X">X</span>  for chords (preserving horizontal position)
-      <i>Section:</i>                for section headers
-      <V1>...</V1> etc.              for verse/chorus blocks
-
-    Page <title> format: "SONG Chords - ARTIST | E-CHORDS"
-    """
-    # Title + artist from page <title> ("Song Name Chords - Artist Name | E-CHORDS")
-    title, artist = '', ''
-    page_title_m = re.search(r'<title>(.*?)</title>', html, re.DOTALL)
-    if page_title_m:
-        pt = page_title_m.group(1).strip()
-        m = re.match(r'^(.*?)\s+[Cc]hords\s*[-–]\s*(.*?)\s*\|', pt)
-        if m:
-            title  = m.group(1).strip()
-            artist = m.group(2).strip()
-    if not title:
-        h1_m = re.search(r'<h1[^>]*>(.*?)</h1>', html, re.DOTALL)
-        title = _strip_html(h1_m.group(1)).strip() if h1_m else ''
-    key_m = re.search(r'[Tt]onality[^:]*:\s*([A-G][#b]?m?)', html)
-    key   = key_m.group(1) if key_m else ''
-    capo_m = re.search(r'\bcapo\b[^0-9<]{0,20}(\d{1,2})', _strip_html(html), re.IGNORECASE)
-    capo   = int(capo_m.group(1)) if capo_m and 0 < int(capo_m.group(1)) < 12 else 0
-
-    # Extract <pre> block
-    pre_m = re.search(r'<pre[^>]*>(.*?)</pre>', html, re.DOTALL | re.IGNORECASE)
-    if not pre_m:
-        return {'title': title, 'artist': artist, 'key': key, 'capo': capo, 'chart_text': ''}
-    pre_content = pre_m.group(1)
-
-    # Step 1: convert <i>Section:</i> to [SECTION]
-    def replace_i_header(m):
-        text = _strip_html(m.group(1)).strip().rstrip(':').strip().upper()
-        bracket = _echords_section_tag(text)
-        if bracket:
-            return bracket
-        if SECTION_NAME_RE.match(text):
-            return f'[{text}]'
-        return m.group(0)  # leave as-is
-    pre_content = re.sub(r'<i>(.*?)</i>', replace_i_header, pre_content, flags=re.DOTALL)
-
-    # Step 2: convert section open tags <V1>, <R>, <PONTE> etc. to [HEADER]
-    def replace_section_open(m):
-        tag = m.group(1)
-        bracket = _echords_section_tag(tag)
-        return ('\n' + bracket + '\n') if bracket else ''
-    pre_content = re.sub(r'<([A-Za-z][A-Za-z0-9]*)(?:\s[^>]*)?>(?!\s*/)', replace_section_open, pre_content)
-
-    # Step 3: strip closing section tags </V1> etc. and remaining HTML tags
-    pre_content = re.sub(r'</[A-Za-z][A-Za-z0-9]*>', '', pre_content)
-    # Strip data-chord spans — keep text content (the chord is the visible text)
-    pre_content = re.sub(r'<span\s+data-chord="[^"]*">(.*?)</span>', r'\1', pre_content)
-    # Strip any remaining tags
-    pre_content = re.sub(r'<[^>]+>', '', pre_content)
-    # Unescape entities
-    pre_content = html_mod.unescape(pre_content)
-
-    return {
-        'title':      title,
-        'artist':     artist,
-        'key':        key,
-        'capo':       capo,
-        'chart_text': pre_content.strip(),
-    }
-
-
 # ── WorshipChords.com ──────────────────────────────────────────────────────────
 
 def parse_worshipchords_com(html: str) -> dict:
@@ -538,24 +448,54 @@ def parse_worshipchords_com(html: str) -> dict:
         if m:
             artist = m.group(1).strip()
 
-    # Original key from metadata section
-    key_m = re.search(r'[Oo]riginal [Kk]ey.*?([A-G][#b]?m?)\b', html)
-    key   = key_m.group(1) if key_m else ''
+    # Metadata lists two keys: "Original Key: Ab" and "Suggested Worship Key:
+    # G with capo 1" (or just "A"). The chart can be written in EITHER — Holy
+    # Forever's is in the original Db, Build My Life's in the suggested G
+    # shapes — so the chords decide which one applies (see _wc_resolve_key).
+    meta_text = html_mod.unescape(re.sub(r'<[^>]+>', ' ', html))
+    orig_m = re.search(r'Original Key:\s*([A-G][#b]?)(m(?!aj))?', meta_text)
+    sugg_m = re.search(r'Suggested Worship Key:\s*([A-G][#b]?)(m(?!aj))?'
+                       r'(?:\s*with\s*capo\s*(\d{1,2}))?', meta_text, re.IGNORECASE)
+    original  = (orig_m.group(1) + (orig_m.group(2) or '')) if orig_m else ''
+    suggested = (sugg_m.group(1) + (sugg_m.group(2) or '')) if sugg_m else ''
+    sugg_capo = int(sugg_m.group(3)) if sugg_m and sugg_m.group(3) else 0
 
     # Extract <pre> block — use the largest one
     pre_blocks = re.findall(r'<pre[^>]*>(.*?)</pre>', html, re.DOTALL | re.IGNORECASE)
     if not pre_blocks:
-        return {'title': title, 'artist': artist, 'key': key, 'chart_text': ''}
+        return {'title': title, 'artist': artist, 'key': original, 'capo': 0, 'chart_text': ''}
     chart = max(pre_blocks, key=len)
     chart = re.sub(r'<[^>]+>', '', chart)   # strip any HTML
-    chart = html_mod.unescape(chart)
+    chart = html_mod.unescape(chart).strip()
 
+    key, capo = _wc_resolve_key(chart, original, suggested, sugg_capo)
     return {
         'title':      title,
         'artist':     artist,
         'key':        key,
-        'chart_text': chart.strip(),
+        'capo':       capo,
+        'chart_text': chart,
     }
+
+
+def _wc_resolve_key(chart: str, original: str, suggested: str, sugg_capo: int) -> tuple:
+    """Return (concert key, capo) for a WorshipChords.com chart.
+
+    Chords in the suggested key's shapes → concert = suggested + capo, with
+    that capo (G shapes, capo 1 → Ab, capo 1). Otherwise the chart is in the
+    original key with no capo. Keys compare by relative major so a chart the
+    detector reads as Em still matches a suggested G.
+    """
+    try:
+        chord_key = md_to_pro._key_from_body(chart)
+        if suggested and chord_key != 'Unknown' and \
+                md_to_pro._key_idx(chord_key) == md_to_pro._key_idx(suggested):
+            if sugg_capo and 0 < sugg_capo < 12:
+                return md_to_pro.shift_key(suggested, sugg_capo), sugg_capo
+            return suggested, 0
+    except ValueError:
+        pass
+    return original, 0
 
 
 # ── WorshipChords.net ──────────────────────────────────────────────────────────
@@ -602,6 +542,23 @@ def parse_worshipchords_net(html: str) -> dict:
 
 # ── Ultimate Guitar ────────────────────────────────────────────────────────────
 
+def _ug_pro_message(html: str) -> str:
+    """Explain a UG Official/Pro link, with a search for the free versions."""
+    from urllib.parse import quote_plus
+    song = ''
+    m = re.search(r'/tab/[^/"]+/([a-z0-9-]+?)-(?:official|pro|chords|tabs)-\d+', html)
+    if m:
+        song = m.group(1).replace('-', ' ')
+    msg = ("This is an Ultimate Guitar Official (Pro) version, which is only available with a "
+           "UG Pro subscription, so ChordPresenter can't fetch it. Use a free \"Chords\" version "
+           "of the song instead")
+    if song:
+        msg += (f" (search: https://www.ultimate-guitar.com/search.php?search_type=title&value="
+                f"{quote_plus(song)})")
+    return msg + (". If you subscribe, you can open the song's Print view on Ultimate Guitar, "
+                  "copy the chart, and use the Paste tab.")
+
+
 def parse_ultimate_guitar(html: str) -> dict:
     """
     UG embeds everything in a JSON blob at data-content on the page.
@@ -618,6 +575,15 @@ def parse_ultimate_guitar(html: str) -> dict:
         data = json.loads(json_str)
     except json.JSONDecodeError:
         return {'title': '', 'artist': '', 'key': '', 'chart_text': ''}
+
+    # UG "Official" / "Pro" versions are part of the paid UG Pro subscription.
+    # Anonymously the page is just the "Ultimate Guitar Pro" upsell with no
+    # chart (page data holds only official_version / has_pro_tab_version), so
+    # say so plainly instead of "could not parse".
+    page_data = (data.get('store', {}).get('page', {}) or {}).get('data', {}) or {}
+    if not page_data.get('tab') and ('official_version' in page_data or 'has_pro_tab_version' in page_data):
+        return {'title': '', 'artist': '', 'key': '', 'chart_text': '',
+                'error': _ug_pro_message(html)}
 
     # Extract metadata from store.page.data.tab
     tab = {}
@@ -663,6 +629,13 @@ def parse_ultimate_guitar(html: str) -> dict:
 
     content = find_content(data) or ''
 
+    # UG marks every chord explicitly ([ch]Bm7b5[/ch]), so it's the one site
+    # where we KNOW what's a chord. Any marked name our chord grammar rejects
+    # would make its whole line read as lyrics (shown to the audience), so
+    # report those for the app to warn about.
+    marked = set(re.findall(r'\[ch\](.*?)\[/ch\]', content))
+    unrecognized = sorted(c for c in marked if not md_to_pro._is_chord_token(c))
+
     # Convert UG markup to plain chord-above-lyric format
     # [ch]CHORD[/ch] → just CHORD (keep surrounding whitespace for alignment)
     content = re.sub(r'\[ch\](.*?)\[/ch\]', r'\1', content)
@@ -676,6 +649,7 @@ def parse_ultimate_guitar(html: str) -> dict:
         'key':        key,
         'capo':       capo if 0 < capo < 12 else 0,
         'chart_text': content.strip(),
+        'unrecognized_chords': unrecognized,
     }
 
 
@@ -890,7 +864,6 @@ def parse_page(url: str, html_content: str) -> dict:
     parsers = {
         'essentialworship':  parse_essentialworship,
         'worshiptogether':   parse_worshiptogether,
-        'echords':           parse_echords,
         'worshipchords_com': parse_worshipchords_com,
         'worshipchords_net': parse_worshipchords_net,
         'ultimate_guitar':   parse_ultimate_guitar,
@@ -900,6 +873,11 @@ def parse_page(url: str, html_content: str) -> dict:
     }
     parser_fn = parsers.get(site, parse_generic)
     result = parser_fn(html_content)
+    # Tabs → spaces before anything measures columns (a tab would otherwise
+    # count as one column and misplace every chord after it). Tab stop 8,
+    # same as ChordPro's a2crd.
+    if result.get('chart_text'):
+        result['chart_text'] = '\n'.join(l.expandtabs(8) for l in result['chart_text'].split('\n'))
     result['_site'] = site  # include site name for debugging
     # Ensure lyrics_only key always present (False for chord-chart sites)
     result.setdefault('lyrics_only', False)
@@ -926,7 +904,9 @@ def generate_pro(title: str, artist: str, chart_text: str,
             f.write(md_content)
 
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'md_to_pro.py')
-        cmd = ['python3', script, tmp_path]
+        # Same interpreter that's running us — the app's bundled Python, not
+        # whatever "python3" happens to be on PATH.
+        cmd = [sys.executable, script, tmp_path]
         if target_key and target_key.strip():
             cmd += ['--key', target_key.strip()]
         if source_key and source_key.strip():
@@ -975,10 +955,14 @@ def main():
         if not args.url:
             print(json.dumps({'error': '--url is required for --preview mode'}))
             sys.exit(1)
+        reason = unsupported_reason(args.url)
+        if reason:
+            print(json.dumps({'error': reason}))
+            return
         try:
             html_content = fetch_html(args.url)
             data = parse_page(args.url, html_content)
-            if not data['title'] and not data['chart_text']:
+            if not data['title'] and not data['chart_text'] and not data.get('error'):
                 data['error'] = (
                     f'Could not parse page (site: {data.get("_site","unknown")}). '
                     'The site may be blocking or rendering client-side. '
@@ -994,6 +978,10 @@ def main():
 
     # ── Mode 2: Generate from URL ─────────────────────────────────
     if args.url and not args.chart_file:
+        reason = unsupported_reason(args.url)
+        if reason:
+            print(reason, file=sys.stderr)
+            sys.exit(1)
         try:
             html_content = fetch_html(args.url)
             data = parse_page(args.url, html_content)
@@ -1007,8 +995,7 @@ def main():
         src_key = data.get('key') or None
         site_capo = data.get('capo') or 0
         if src_key and site_capo:
-            from md_to_pro import shift_key
-            src_key = shift_key(src_key, -site_capo)
+            src_key = md_to_pro.shift_key(src_key, -site_capo)
         generate_pro(data['title'], data['artist'], data['chart_text'],
                      args.key or data.get('key') or None, args.out,
                      lyrics_only=effective_lyrics_only,

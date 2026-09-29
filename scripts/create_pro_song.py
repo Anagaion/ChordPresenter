@@ -79,6 +79,7 @@ RTF_HEADER = (
 
 _UNICODE_MAP = str.maketrans({
     '‘': "'",  '’': "'",   # curly single quotes → straight
+    'ʼ': "'",  '′': "'",   # modifier-letter apostrophe, prime → straight
     '“': '"',  '”': '"',   # curly double quotes → straight
     '–': '-',  '—': '--',  # en/em dash → hyphen
     '…': '...', ' ': ' ',  # ellipsis, non-breaking space
@@ -92,7 +93,24 @@ def build_rtf(line1, line2=None):
         text = line1 + '\\\n' + line2
     else:
         text = line1
-    return (RTF_HEADER + text + '}').encode('latin-1')
+    return (RTF_HEADER + _rtf_unicode(text) + '}').encode('latin-1')
+
+
+def _rtf_unicode(text):
+    """Write any character Latin-1 can't hold as an RTF \\uN? escape (UTF-16
+    code units, signed) instead of crashing — non-Latin lyrics, rare
+    punctuation. Each character still occupies one position in the slide text,
+    so chord positions stay aligned."""
+    out = []
+    for ch in text:
+        if ord(ch) < 256:
+            out.append(ch)
+            continue
+        units = ch.encode('utf-16-be')
+        for i in range(0, len(units), 2):
+            n = int.from_bytes(units[i:i + 2], 'big')
+            out.append(f'\\u{n - 65536 if n > 32767 else n}?')
+    return ''.join(out)
 
 # ────────────────────────────────────────────────────────────────
 # SLIDE BUILDER  (binary template — DoubleThickTheme format,

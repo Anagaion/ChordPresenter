@@ -2,12 +2,14 @@ import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
 import { open } from "@tauri-apps/api/dialog";
 import { listen } from "@tauri-apps/api/event";
+import { open as openUrl } from "@tauri-apps/api/shell";
 import "./App.css";
 import {
   MAJOR_KEYS, MINOR_KEYS, analyzeKey, prefersFlats,
   semitonesBetween, shiftKey, toConcert, transposeChart,
 } from "./music";
 import { buildPrintHtml } from "./print";
+import { extractChartBody, normalizeChartHeaders, parseSongMeta, preparePastedChart } from "./chart";
 
 // Sentinel used to join a slide's lyric lines into one exportable chart line
 // when a slide has 2 lines (Edit .pro mode). U+E000 (Private Use Area) never
@@ -18,90 +20,12 @@ import { buildPrintHtml } from "./print";
 // separate 1-line slides. Must match SLIDE_LINE_SEP in md_to_pro.py.
 const SLIDE_LINE_SEP = "\ue000";
 
-function parseSongMeta(mdContent: string): { title: string; artist: string } {
-  const m = mdContent.match(/^title:\s*"([^"]+)"/m);
-  if (!m) return { title: "", artist: "" };
-  const parts = m[1].split("|").map(p => p.trim());
-  const title = parts[0].replace(/\s*\|\s*chords.*/i, "").trim();
-  const artist = parts[1] && !/^chords/i.test(parts[1]) ? parts[1] : "";
-  return { title, artist };
-}
-
-/** Extract the chart body from an MD file for preview/editing.
- *  Tries the ``` code block first, then falls back to stripping frontmatter. */
-function extractChartBody(mdContent: string): string {
-  const codeMatch = mdContent.match(/```[^\n]*\n([\s\S]*?)```/);
-  if (codeMatch) return codeMatch[1].trim();
-  // Fallback: strip YAML frontmatter and leading blank lines
-  return mdContent.replace(/^---\s*\n[\s\S]*?\n---\s*\n?/, "").trim();
-}
-
-/**
- * Normalise section headers in a chart body so the preview shows what
- * ProPresenter will actually receive, matching the Python parser's output.
- *
- * Rules (applied per line, non-indented lines only):
- *  [VERSE 1] / [chorus]     → [Verse 1] / [Chorus]   (bracket + title-case)
- *  First Verse / Second Chorus → [Verse 1] / [Chorus 2]  (ordinal words)
- *  Verse 1: / CHORUS        → [Verse 1] / [Chorus]   (named without brackets)
- */
-function normalizeChartHeaders(chart: string): string {
-  const ORDINAL_MAP: Record<string, string> = {
-    first:'1', second:'2', third:'3', fourth:'4', fifth:'5',
-    sixth:'6', seventh:'7', eighth:'8', ninth:'9', tenth:'10',
-  };
-  const SECTION_WORDS =
-    'intro|verse|chorus|pre[\\s\\-]?chorus|bridge|tag|outro|interlude|' +
-    'instrumental|ending|coda|hook|turn|turnaround|transition|vamp|breakdown|refrain';
-  const ORDINAL_RE = new RegExp(
-    `^(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\\s+(${SECTION_WORDS})\\s*:?\\s*$`,
-    'i'
-  );
-  const NAMED_RE = new RegExp(
-    `^(${SECTION_WORDS})\\s*(\\d*)\\s*:?\\s*$`,
-    'i'
-  );
-
-  return chart.split('\n').map(line => {
-    const trimmed = line.trim();
-    if (!trimmed) return line;
-
-    // Already bracketed: normalise capitalisation of first word, preserve number.
-    // [VERSE 1] → [Verse 1],  [chorus] → [Chorus],  [Pre-Chorus] → [Pre-Chorus]
-    const bracketM = trimmed.match(/^\[([^\]]+)\](.*)/);
-    if (bracketM) {
-      const parts = bracketM[1].trim().split(/\s+/);
-      const label = parts[0].charAt(0).toUpperCase() + parts[0].slice(1).toLowerCase();
-      const rest  = parts.slice(1).join(' ');
-      return `[${rest ? `${label} ${rest}` : label}]${bracketM[2]}`;
-    }
-
-    // Section headers are never indented — skip indented lines.
-    if (line[0] === ' ' || line[0] === '\t') return line;
-
-    // Ordinal: "First Verse" → "[Verse 1]"
-    const ordM = trimmed.match(ORDINAL_RE);
-    if (ordM) {
-      const num = ORDINAL_MAP[ordM[1].toLowerCase()];
-      const sec = ordM[2].charAt(0).toUpperCase() + ordM[2].slice(1).toLowerCase();
-      return `[${sec} ${num}]`;
-    }
-
-    // Named without brackets: "Verse 1:" / "CHORUS" → "[Verse 1]" / "[Chorus]"
-    const namedM = trimmed.match(NAMED_RE);
-    if (namedM) {
-      const sec = namedM[1].charAt(0).toUpperCase() + namedM[1].slice(1).toLowerCase();
-      const num = namedM[2] ? ` ${namedM[2]}` : '';
-      return `[${sec}${num}]`;
-    }
-
-    return line;
-  }).join('\n');
-}
+// What the app expects in a chart (sections, chord lines, Key:/Capo: lines).
+const CHART_GUIDE_URL = "https://github.com/Anagaion/ChordPresenter/blob/main/docs/CHART_FORMAT.md";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 type Status     = "idle" | "running" | "ok" | "err";
-type Mode       = "file" | "url" | "pro";
+type Mode       = "file" | "url" | "paste" | "pro";
 type OutputMode = "both" | "lyrics";
 
 interface AppConfig {
@@ -114,6 +38,8 @@ interface EwData {
   key: string;
   capo?: number;
   chart_text: string;
+  /** Chords the site marked that our parser doesn't recognize (UG only). */
+  unrecognized_chords?: string[];
   lyrics_only?: boolean;
   error?: string;
 }
@@ -288,6 +214,14 @@ export default function App() {
   const [isFetching, setIsFetching] = useState(false);
   const [ewData, setEwData]         = useState<EwData | null>(null);
   const [editedChart, setEditedChart] = useState("");
+
+  // ── Paste mode state ───────────────────────────────────────────
+  // pasteRaw is what the user pasted; pasteChart is the prepared, editable
+  // chart (set by "Use This Chart", which also runs key/capo detection).
+  const [pasteRaw, setPasteRaw]       = useState("");
+  const [pasteTitle, setPasteTitle]   = useState("");
+  const [pasteArtist, setPasteArtist] = useState("");
+  const [pasteChart, setPasteChart]   = useState("");
 
   // ── Pro edit mode state ────────────────────────────────────────
   const [proPath, setProPath]     = useState("");
@@ -513,7 +447,7 @@ export default function App() {
       } else {
         // Site key/capo win over what's written in the chart; chords fill in.
         const chart = data.chart_text || "";
-        const info = analyzeKey(chart, chart, data.key || "", data.capo || 0);
+        const info = analyzeKey(chart, chart, data.key || "", data.capo);
         setEwData(data); setEditedChart(normalizeChartHeaders(toConcert(chart, info)));
         applyKeyInfo(info);
         setTitle(data.title || ""); setArtist(data.artist || "");
@@ -525,6 +459,45 @@ export default function App() {
       setIsFetching(false);
     }
   }, [urlInput, applyKeyInfo]);
+
+  // ── Paste mode: prepare the pasted text like a fetched chart ───
+  const usePastedChart = useCallback(() => {
+    if (!pasteRaw.trim()) return;
+    const { chart, titleGuess, artistGuess } = preparePastedChart(pasteRaw);
+    // Key:/Capo: lines are read from the raw paste; chords from the chart.
+    const info = analyzeKey(pasteRaw, chart);
+    applyKeyInfo(info);
+    setPasteChart(normalizeChartHeaders(toConcert(chart, info)));
+    if (!pasteTitle.trim() && titleGuess) setPasteTitle(titleGuess);
+    if (!pasteArtist.trim() && artistGuess) setPasteArtist(artistGuess);
+    setStatus("idle"); setMessage("");
+  }, [pasteRaw, pasteTitle, pasteArtist, applyKeyInfo]);
+
+  const clearPaste = useCallback(() => {
+    setPasteRaw(""); setPasteTitle(""); setPasteArtist(""); setPasteChart("");
+    setDetectedKey(""); setTargetKey("");
+    setSourceCapo(0); setSourceShapes(""); setOutputCapo(0);
+    setStatus("idle"); setMessage("");
+  }, []);
+
+  const generateFromPaste = useCallback(async () => {
+    if (!pasteChart.trim()) return;
+    setStatus("running"); setMessage("Generating…");
+    try {
+      const out = await invoke<string>("generate_from_url", {
+        title: pasteTitle.trim() || "Untitled", artist: pasteArtist.trim(),
+        chartText: pasteChart, targetKey: targetKey || null,
+        sourceKey: detectedKey || null,
+        capo: outputMode === "lyrics" ? 0 : outputCapo,
+        outputDir, lyricsOnly: outputMode === "lyrics",
+      });
+      setStatus("ok");
+      const match = out.match(/→\s+(.+\.pro)/);
+      setMessage(match ? `Saved: ${match[1]}` : (out.trim() || "Done!"));
+    } catch (err) {
+      setStatus("err"); setMessage(String(err));
+    }
+  }, [pasteChart, pasteTitle, pasteArtist, targetKey, detectedKey, outputCapo, outputDir, outputMode]);
 
   const generateFromUrl = useCallback(async () => {
     if (!ewData) return;
@@ -545,9 +518,15 @@ export default function App() {
     }
   }, [ewData, editedChart, targetKey, detectedKey, outputCapo, outputDir, outputMode]);
 
+  // The chart + song details for whichever tab is showing.
+  const currentChart = () =>
+    mode === "file"  ? { chart: fileChart,  songTitle: title,      songArtist: artist } :
+    mode === "paste" ? { chart: pasteChart, songTitle: pasteTitle, songArtist: pasteArtist } :
+                       { chart: editedChart, songTitle: ewData?.title || "", songArtist: ewData?.artist || "" };
+
   // ── Shared: print chart (current key + capo, as the stage monitor shows) ─
   const printChart = useCallback(async () => {
-    const chart = mode === "file" ? fileChart : editedChart;
+    const { chart, songTitle, songArtist } = currentChart();
     if (!chart.trim()) return;
     const key = targetKey || detectedKey;
     const capo = outputMode === "lyrics" ? 0 : outputCapo;
@@ -558,8 +537,6 @@ export default function App() {
         printed = transposeChart(chart, semitonesBetween(detectedKey, shapesKey), prefersFlats(shapesKey));
       }
     } catch { /* unknown key label — print the chart as-is */ }
-    const songTitle = mode === "file" ? title : (ewData?.title || "");
-    const songArtist = mode === "file" ? artist : (ewData?.artist || "");
     try {
       await invoke("open_print_view", {
         title: `${songTitle || "Chart"}${key ? ` - ${key}` : ""}${capo ? ` (Capo ${capo})` : ""}`,
@@ -568,7 +545,8 @@ export default function App() {
     } catch (err) {
       setStatus("err"); setMessage(`Print failed: ${err}`);
     }
-  }, [mode, fileChart, editedChart, targetKey, detectedKey, outputCapo, outputMode, title, artist, ewData]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, fileChart, editedChart, pasteChart, pasteTitle, pasteArtist, targetKey, detectedKey, outputCapo, outputMode, title, artist, ewData]);
 
   // ── Shared: output folder ──────────────────────────────────────
   const browseOutput = useCallback(async () => {
@@ -580,11 +558,12 @@ export default function App() {
   const hasFile     = Boolean(mdPath);
   const fileName    = mdPath.split("/").pop() ?? "";
   const hasOutputDir = Boolean(outputDir);
-  const canGenerate = hasOutputDir && (mode === "file"
-    ? hasFile && Boolean(fileChart) && status !== "running"
-    : Boolean(ewData) && !ewData?.error && status !== "running" && !isFetching);
+  const canGenerate = hasOutputDir && status !== "running" && (
+    mode === "file"  ? hasFile && Boolean(fileChart) :
+    mode === "paste" ? Boolean(pasteChart.trim()) :
+                       Boolean(ewData) && !ewData?.error && !isFetching);
 
-  const canPrint = Boolean((mode === "file" ? fileChart : editedChart).trim());
+  const canPrint = Boolean(currentChart().chart.trim());
 
   // Key of the chord shapes written out for the current key + capo.
   let outputShapes = "";
@@ -593,7 +572,10 @@ export default function App() {
     if (k && outputCapo) outputShapes = shiftKey(k, -outputCapo);
   } catch { /* unknown key label */ }
 
-  const showSharedControls = (mode === "file" && hasFile) || Boolean(ewData && !ewData.error);
+  const showSharedControls =
+    (mode === "file" && hasFile) ||
+    (mode === "url" && Boolean(ewData && !ewData.error)) ||
+    (mode === "paste" && Boolean(pasteChart.trim()));
 
   return (
     <div className="app">
@@ -622,6 +604,9 @@ export default function App() {
         </button>
         <button className={`tab${mode === "url" ? " active" : ""}`} onClick={() => switchMode("url")}>
           🔗 URL
+        </button>
+        <button className={`tab${mode === "paste" ? " active" : ""}`} onClick={() => switchMode("paste")}>
+          📋 Paste
         </button>
         <button className={`tab${mode === "pro" ? " active" : ""}`} onClick={() => switchMode("pro")}>
           ✏️ Edit .pro
@@ -676,7 +661,7 @@ export default function App() {
             <input
               className="url-input"
               type="url"
-              placeholder="Paste a URL (EssentialWorship, WorshipTogether, Ultimate Guitar, WorshipChords, E-Chords…)"
+              placeholder="Paste a song link (Ultimate Guitar, WorshipTogether, EssentialWorship, WorshipChords…)"
               value={urlInput}
               onChange={e => setUrlInput(e.target.value)}
               onKeyDown={e => { if (e.key === "Enter") fetchEW(); }}
@@ -701,6 +686,13 @@ export default function App() {
             </div>
           )}
 
+          {ewData && !ewData.error && (ewData.unrecognized_chords?.length ?? 0) > 0 && (
+            <p className="no-output-warning">
+              ⚠️ Chords not recognized: <strong>{ewData.unrecognized_chords!.join(", ")}</strong>.
+              Lines containing them may appear as lyrics on the audience screen — check the preview.
+            </p>
+          )}
+
           {ewData && !ewData.error && (
             <div className="chart-section">
               <div className="chart-label">Chart preview — edit before generating if needed:</div>
@@ -708,6 +700,58 @@ export default function App() {
                 className="chart-textarea"
                 value={editedChart}
                 onChange={e => setEditedChart(e.target.value)}
+                spellCheck={false}
+              />
+            </div>
+          )}
+        </>
+      )}
+
+      {/* ══ PASTE MODE ═════════════════════════════════════════════ */}
+      {mode === "paste" && (
+        <>
+          <div className="paste-meta">
+            <input className="url-input" placeholder="Song title" value={pasteTitle}
+              onChange={e => setPasteTitle(e.target.value)} />
+            <input className="url-input" placeholder="Artist (optional)" value={pasteArtist}
+              onChange={e => setPasteArtist(e.target.value)} />
+          </div>
+
+          {!pasteChart ? (
+            <div className="chart-section">
+              <div className="chart-label paste-label-row">
+                <span>Paste a chord chart (chords above lyrics) — from a website's print view, a PDF, an email…</span>
+                <button className="link-btn" onClick={() => openUrl(CHART_GUIDE_URL)}>Formatting guide</button>
+              </div>
+              <textarea
+                className="chart-textarea paste-textarea"
+                placeholder={"[Verse 1]\nG           C          G\nAmazing grace how sweet the sound\n…"}
+                value={pasteRaw}
+                onChange={e => setPasteRaw(e.target.value)}
+                spellCheck={false}
+              />
+              <button
+                className={`fetch-btn paste-use-btn${!pasteRaw.trim() ? " disabled" : ""}`}
+                onClick={usePastedChart}
+                disabled={!pasteRaw.trim()}
+              >
+                Use This Chart →
+              </button>
+            </div>
+          ) : (
+            <div className="chart-section">
+              <div className="chart-label paste-label-row">
+                <span>Chart preview — edit before generating if needed:</span>
+                <span>
+                  <button className="link-btn" onClick={() => openUrl(CHART_GUIDE_URL)}>Formatting guide</button>
+                  {" · "}
+                  <button className="link-btn" onClick={clearPaste}>Start over</button>
+                </span>
+              </div>
+              <textarea
+                className="chart-textarea"
+                value={pasteChart}
+                onChange={e => setPasteChart(e.target.value)}
                 spellCheck={false}
               />
             </div>
@@ -937,7 +981,7 @@ export default function App() {
           <div className="action-row">
             <button
               className={`generate-btn${!canGenerate ? " disabled" : ""}`}
-              onClick={mode === "file" ? generateFromFile : generateFromUrl}
+              onClick={mode === "file" ? generateFromFile : mode === "paste" ? generateFromPaste : generateFromUrl}
               disabled={!canGenerate}
               title={!hasOutputDir ? "Set an output folder in Preferences first" : undefined}
             >

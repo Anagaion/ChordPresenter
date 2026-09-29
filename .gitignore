@@ -23,3 +23,10 @@ npm-debug.log*
 .vscode/*
 !.vscode/extensions.json
 .idea
+
+# Test fixtures saved from real song sites (copyrighted lyrics/charts) — local only
+tests/fixtures/local/
+
+# Bundled Python runtime — created by scripts/build/bundle_python.sh
+src-tauri/python-runtime/*
+!src-tauri/python-runtime/README.md

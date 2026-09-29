@@ -95,35 +95,117 @@ def _normalize_ordinal_section(name: str) -> str:
 # CHORD / LYRIC LINE DETECTION
 # ────────────────────────────────────────────────────────────────
 
-# A single chord token: root [accidental] [quality] [interval] [slash bass]
-_CHORD_TOKEN_RE = re.compile(
-    r'^[A-G][#b]?'
-    r'(m|maj|min|M|dim|aug|°|ø)?'
-    r'(maj|min)?'
-    r'(7|9|11|13|6|5|4|2)?'
-    r'(sus[24]?|add[29]?|omit[35]?)?'
-    r'(/[A-G][#b]?)?$'
-)
+# ── Chord grammar (shared with src/music.ts via chord_grammar.json) ──────────
+# A chord is ROOT + quality + an extension known for that quality
+# (+ bracketed additions like "(sus4)", "(b9)") + optional "/BASS".
+# The lists live in chord_grammar.json so Python and the app can't drift apart.
+import json as _json
 
-def _is_chord_token(tok):
-    return bool(_CHORD_TOKEN_RE.match(tok)) or tok in ('N.C.', 'NC', 'Asus', 'Dsus', 'Esus', 'Bsus')
+def _load_chord_grammar():
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'chord_grammar.json'),
+              encoding='utf-8') as f:
+        return _json.load(f)
+
+_GRAMMAR = _load_chord_grammar()
+
+def _alt(items, escape=True):
+    items = sorted(items, key=len, reverse=True)          # longest first
+    return '|'.join(re.escape(i) if escape else i for i in items)
+
+_ROOT = f'(?:{_alt(_GRAMMAR["roots"])})'
+_QUALITY_BRANCHES = '|'.join(
+    f'(?P<q_{fam}>{_alt(_GRAMMAR["qualities"][fam])})(?:{_alt(_GRAMMAR["extensions"][fam])})'
+    for fam in ('minor', 'augmented', 'diminished', 'half_diminished', 'major')
+)
+_BRACKETED = f'(?:\\((?:{_alt(_GRAMMAR["bracketed_additions"], escape=False)})\\))*'
+_CHORD_RE = re.compile(f'^(?P<root>{_ROOT})(?:{_QUALITY_BRANCHES}){_BRACKETED}(?:/(?P<bass>{_ROOT}))?$')
+_NO_CHORD = set(_GRAMMAR['no_chord'])
+_BARE_DASH_RE = re.compile(r'^[A-G][#b]?-+(/|$)')
+
+
+def chord_quality(tok: str) -> str | None:
+    """'minor' / 'major' / 'augmented' / 'diminished' / 'half_diminished' for a
+    chord token, 'no_chord' for N.C., or None if it isn't a chord."""
+    if tok in _NO_CHORD:
+        return 'no_chord'
+    # A bare trailing dash is a connector ("C-Bb-Ab" walks down), not minor;
+    # "-" means minor only with something after it ("C-7", "C-9").
+    if _BARE_DASH_RE.match(tok):
+        return None
+    m = _CHORD_RE.match(tok)
+    if not m:
+        return None
+    for fam in ('minor', 'augmented', 'diminished', 'half_diminished', 'major'):
+        if m.group(f'q_{fam}') is not None:
+            return fam
+    return None
+
+
+def _is_chord_token(tok: str) -> bool:
+    return chord_quality(tok) is not None
+
+
+# Non-chord tokens allowed on a chord line: bars, dashes, slashes (strum
+# marks), dots, repeat marks. Same set as CHORD_LINE_FILLER in src/music.ts.
+_FILLER_RE = re.compile(r'^(-+|/+|\.+|%|\*+|x\d+|\d+x|\(x?\d+x?\))$', re.IGNORECASE)
+
+
+def scan_chord_line(line: str):
+    """Read a line as a chord line.
+
+    Returns [(column, chord), …] if every piece of the line is a chord or
+    filler and there's at least one chord; otherwise None. Columns are in the
+    line as given (callers pass the raw, tab-expanded line). "|" always
+    separates; "(G)" and "G*" are unwrapped; "G-D" is split at the dashes
+    unless the whole token is a chord ("C-7" is C minor 7).
+    """
+    found = []
+    for m in re.finditer(r'[^\s|]+', line):
+        tok, col = m.group(), m.start()
+        if _FILLER_RE.match(tok):
+            continue
+        core = tok
+        if core.endswith('*'):
+            core = core.rstrip('*')
+        if core.startswith('('):
+            core, col = core[1:], col + 1
+        if core.endswith(')') and core.count(')') > core.count('('):
+            core = core[:-1]
+        if _is_chord_token(core):
+            found.append((col, core))
+            continue
+        parts = [(pm.start(), pm.group()) for pm in re.finditer(r'[^-]+', core)]
+        if parts and all(_is_chord_token(p) for _, p in parts):
+            found.extend((col + off, p) for off, p in parts)
+            continue
+        return None
+    return found or None
+
 
 def is_chord_line(line: str) -> bool:
-    """Return True if the line contains only chord symbols and formatting characters."""
-    stripped = line.strip()
-    if not stripped:
-        return True
-    if stripped.startswith('|'):          # | F | C/E ... | instrumental
-        return True
-    if stripped in ('N.C.', 'NC'):
-        return True
-    # Remove formatting, split into tokens, check each
-    clean = re.sub(r'[|/\-\.]', ' ', stripped)
-    tokens = [t for t in clean.split() if t]
-    if not tokens:
-        return True
-    return all(_is_chord_token(t) for t in tokens)
+    """True if the line is chords (plus bars, dashes, repeat marks) only."""
+    return scan_chord_line(line.strip()) is not None
 
+
+def is_filler_line(line: str) -> bool:
+    """A line of only bars/dashes/strum slashes and no chords ("| / / / |")."""
+    toks = re.findall(r'[^\s|]+', line)
+    return bool(line.strip()) and all(_FILLER_RE.match(t) for t in toks)
+
+# Guitar-tab staff line: "e|--7--9--|", "B|-10-12-|(x4)", "|---5---|". UG
+# "(Tab)" pages and tab snippets inside chord charts put these outside any
+# [Tab] section; they're neither chords nor lyrics, so they're dropped.
+_TAB_STAFF_RE = re.compile(r'^([A-Ga-g][#b]?\s*)?\|[-0-9hpbrx/\\~()|.*^\s]*-[-0-9hpbrx/\\~()|.*^\s]*$')
+
+def is_tab_staff_line(line: str) -> bool:
+    return bool(_TAB_STAFF_RE.match(line.strip()))
+
+# A line of only dashes/equals/dots/underscores is a visual divider, not an
+# empty chord line (which would become a blank slide).
+_DIVIDER_RE = re.compile(r'^[-=._~*]{3,}$')
+
+def is_divider_line(line: str) -> bool:
+    return bool(_DIVIDER_RE.match(line.strip())) or is_filler_line(line)
 
 # ────────────────────────────────────────────────────────────────
 # DIATONIC KEY DETECTION  (chord-quality aware)
@@ -137,22 +219,20 @@ _ENH = {
 
 def _normalize_chord(chord: str) -> str:
     """
-    Reduce a chord to root + 'm' (minor) or just root (major/sus/dom/etc.).
-    Slash bass notes and all extensions are stripped.
+    Reduce a chord to root + 'm' (minor) or just root (everything else).
+    Slash bass notes and all extensions are stripped. Minor means the
+    grammar's minor family: m, mi, min, - (so Em7, Emi7, E-7 → 'Em').
 
     Examples:
         G, Gmaj7, Gsus4, G7, G/B  → 'G'
-        Em, Em7, Em7sus4           → 'Em'
+        Em, Em7, Em7sus4, E-7      → 'Em'
         F#m, F#m7                  → 'F#m'
-        Dm, Dm9                    → 'Dm'
     """
-    chord = chord.split('/')[0]                        # strip /bass
-    m = re.match(r'^([A-G][#b]?)(.*)', chord)
-    if not m:
+    fam = chord_quality(chord)
+    m = re.match(r'^([A-G][#b]?)', chord)
+    if not m or fam in (None, 'no_chord'):
         return ''
-    root, quality = m.group(1), m.group(2)
-    is_minor = bool(re.match(r'^m(?!aj)', quality))    # 'm' but not 'maj'
-    return root + ('m' if is_minor else '')
+    return m.group(1) + ('m' if fam == 'minor' else '')
 
 def _chord_variants(norm: str) -> tuple:
     """Return (norm, enharmonic-twin) for set-membership checks."""
@@ -373,6 +453,7 @@ def parse_md_song(filepath: str):
         pending_chord_line = None
 
     for raw_line in body.splitlines():
+        raw_line = raw_line.expandtabs(8)   # tabs → spaces before any column work
         stripped = raw_line.strip()
 
         # ── Section header: bracket format [VERSE 1], [Chorus], etc. ────
@@ -418,16 +499,30 @@ def parse_md_song(filepath: str):
         if re.match(r'^REPEAT\s+', stripped, re.IGNORECASE):
             continue
 
+        # ── Skip guitar-tab staff lines (e|--7--|) and dividers (-----) ──
+        # A line starting with a bar that isn't a chord line ("| p  pull-off",
+        # a tab legend) is never sung — keep it off the slides.
+        if is_tab_staff_line(stripped) or is_divider_line(stripped) or \
+                (stripped.startswith('|') and not is_chord_line(stripped)):
+            pending_chord_line = None
+            continue
+
         if is_chord_line(stripped):
-            pending_chord_line = stripped
+            # Keep the chord line's leading spaces: they're what put a chord
+            # over the right syllable. (Stripping them used to slide every
+            # indented chord line to the start of the lyric.)
+            pending_chord_line = raw_line.rstrip()
             cur_chord_lines.append(stripped)
             continue
 
         # It's a lyric line
-        # Pair with the pending chord line for chord position mapping
+        # Pair with the pending chord line for chord position mapping. Columns
+        # are measured from where the lyric text starts, since the slide gets
+        # the stripped lyric.
         chord_positions = {}
         if pending_chord_line is not None:
-            chord_positions = _map_chord_positions(pending_chord_line, stripped)
+            lyric_indent = len(raw_line) - len(raw_line.lstrip())
+            chord_positions = _map_chord_positions(pending_chord_line, stripped, lyric_indent)
             pending_chord_line = None
 
         # ── Explicit 2-line slide sentinel (ChordPresenter Edit .pro mode) ──
@@ -448,20 +543,19 @@ def parse_md_song(filepath: str):
             continue
 
         # Normalize chord-alignment spaces (e.g. "gave   me   one  more   day" → clean)
-        lyric_clean = re.sub(r'  +', ' ', stripped)
+        # Squeeze runs of spaces to one — and move each chord with its text,
+        # or every chord after a gap would land too far right (chord positions
+        # were measured on the unsqueezed line).
+        lyric_clean, chord_positions = _squeeze_spaces(stripped, chord_positions)
 
         # ── Dash rule: "An - other" → "Another" ─────────────────────────────
         # Worship charts use " - " to mark sustained syllable breaks within words.
         # Simply remove the dash and join the syllables.
         # Edge cases like "no - one" → "noone" are rare and can be fixed in preview.
-        dash_matches = list(re.finditer(r'\s+-\s+', lyric_clean))
-        if dash_matches:
-            new_pos = {}
-            for pos, chord in chord_positions.items():
-                shift = sum(len(m.group()) for m in dash_matches if m.start() < pos)
-                new_pos[max(0, pos - shift)] = chord
-            chord_positions = new_pos
-            lyric_clean = re.sub(r'\s+-\s+', '', lyric_clean)
+        # Syllable dashes ("A - maz - ing") are removed to rejoin the word;
+        # chords over a removed dash move to the start of the next syllable.
+        lyric_clean, chord_positions = _remove_spans(
+            lyric_clean, [m.span() for m in re.finditer(r'\s+-\s+', lyric_clean)], chord_positions)
 
         # Comma rule: "phrase one, phrase two" → 2-line slide with hard RTF break.
         # Delete the comma; each phrase becomes its own line within one slide.
@@ -500,26 +594,95 @@ def parse_md_song(filepath: str):
     return title, artist, sections, chord_map
 
 
-def _map_chord_positions(chord_line: str, lyric_line: str) -> dict:
+def _squeeze_spaces(text: str, positions: dict) -> tuple:
+    """Collapse runs of spaces to one, remapping {char_pos: chord} to the
+    squeezed text. A chord over a removed space moves to the next kept
+    character; none end up past the last character or share a position."""
+    out, new_index, prev_space = [], [], False
+    for ch in text:
+        new_index.append(len(out))
+        if ch == ' ' and prev_space:
+            continue
+        out.append(ch)
+        prev_space = ch == ' '
+    squeezed = ''.join(out)
+    if not positions:
+        return squeezed, positions
+    last = len(squeezed) - 1
+    items = sorted(positions.items())
+    cols = [new_index[pos] if pos < len(new_index) else last for pos, _ in items]
+    return squeezed, _spread_positions(cols, [c for _, c in items], last)
+
+
+def _remove_spans(text: str, spans: list, positions: dict) -> tuple:
+    """Delete the given (start, end) spans from text, remapping chord
+    positions: a chord inside a removed span moves to the next kept
+    character; no two chords end up sharing one."""
+    if not spans:
+        return text, positions
+    out, new_index, cut = [], [], iter(sorted(spans))
+    span = next(cut, None)
+    for i, ch in enumerate(text):
+        while span and i >= span[1]:
+            span = next(cut, None)
+        new_index.append(len(out))
+        if span and span[0] <= i < span[1]:
+            continue
+        out.append(ch)
+    result = ''.join(out)
+    if not positions:
+        return result, positions
+    items = sorted(positions.items())
+    last = len(result) - 1
+    cols = [new_index[pos] if pos < len(new_index) else last for pos, _ in items]
+    return result, _spread_positions(cols, [c for _, c in items], last)
+
+
+def _spread_positions(cols: list, chords: list, last: int) -> dict:
+    """Place chords (in order) on character positions 0..last as close to
+    their columns as possible, never sharing one: clamp, push collisions
+    right, then pull anything past the end back left. If there are more
+    chords than characters, the last ones are kept."""
+    if last < 0 or not chords:
+        return {}
+    cols, chords = cols[-(last + 1):], chords[-(last + 1):]
+    pos = [min(max(c, 0), last) for c in cols]
+    for i in range(1, len(pos)):
+        pos[i] = max(pos[i], pos[i - 1] + 1)
+    pos[-1] = min(pos[-1], last)
+    for i in range(len(pos) - 2, -1, -1):
+        pos[i] = min(pos[i], pos[i + 1] - 1)
+    return dict(zip(pos, chords))
+
+
+def _map_chord_positions(chord_line: str, lyric_line: str, lyric_indent: int = 0) -> dict:
     """
     Given a chord line and the lyric line beneath it, return a dict of
     {char_position_in_lyric: chord_name} for Phase 2 chord embedding.
 
+    chord_line keeps its original leading spaces; lyric_indent is how many
+    leading spaces the (already stripped) lyric_line had, so columns line up.
+
     Example:
         chord_line = "       C/E    Dm   C    Bb    F/A"
         lyric_line = "'Cause You gave   me   one  more   day"
-        → {7: 'C/E', 11: 'Dm', 17: 'C', 21: 'Bb', 26: 'F/A'}
+        → {7: 'C/E', 14: 'Dm', 19: 'C', 24: 'Bb', 30: 'F/A'}
     """
-    positions = {}
-    # Find each chord token and its position in the chord line
-    for m in re.finditer(r'[A-G][#b]?\S*', chord_line):
-        chord = m.group()
-        if _is_chord_token(chord):
-            col = m.start()
-            # Map column to lyric character position (clamped)
-            lyric_pos = min(col, max(0, len(lyric_line) - 1))
-            positions[lyric_pos] = chord
-    return positions
+    # Find each chord token and its position in the chord line. "|" and an
+    # opening "(" are separators, so "|(G)" and "(D)" are found too.
+    # N.C. marks a chord line but isn't a chord ProPresenter can show, so it's
+    # not written to the slide (same as before v1.2).
+    found = [(max(0, col - lyric_indent), chord)
+             for col, chord in (scan_chord_line(chord_line) or [])
+             if chord not in _NO_CHORD]
+
+    # A chord can only sit on a character of the lyric. Chords before it
+    # starts (lead-in chords) or past its end (a chord after the last word)
+    # get pulled onto it, and two chords must never share a character or one
+    # overwrites the other. So: clamp, push collisions right, then pull
+    # anything past the end back left — every chord stays, in order, as close
+    # to its real column as the lyric allows.
+    return _spread_positions([c for c, _ in found], [ch for _, ch in found], len(lyric_line) - 1)
 
 
 # ────────────────────────────────────────────────────────────────
@@ -672,19 +835,13 @@ def _detect_key(filepath: str) -> str:
 
 def _key_from_body(body: str) -> str:
     """Chord-quality diatonic matching over the whole chart body."""
+    # Slash bass notes don't count ("B/D#" contributes only B — the bass would
+    # otherwise skew detection, e.g. make G#m look better than B major).
     norm_chords = []
     for line in body.splitlines():
-        stripped = line.strip()
-        if stripped and is_chord_line(stripped):
-            # Strip bass notes from slash chords BEFORE splitting on '/'
-            # so that "B/D#" contributes only "B" and not the bass note "D#".
-            # Without this, bass notes score against diatonic sets and skew
-            # key detection (e.g. B/D# makes G#m look better than B major).
-            no_bass = re.sub(r'/[A-G][#b]?', '', stripped)
-            tokens = [t for t in re.sub(r'[|\-]', ' ', no_bass).split()
-                      if t and _is_chord_token(t)]
-            norm_chords.extend(_normalize_chord(t) for t in tokens)
-    norm_chords = [c for c in norm_chords if c]  # drop empty strings
+        for _, chord in scan_chord_line(line.strip()) or []:
+            norm_chords.append(_normalize_chord(chord.split('/')[0]))
+    norm_chords = [c for c in norm_chords if c]  # drop empty strings (N.C.)
 
     return _key_from_chords(norm_chords)  # returns 'Unknown' if list is empty
 
