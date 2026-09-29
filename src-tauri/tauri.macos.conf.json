@@ -1,0 +1,15 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "resources": [
+      "../scripts/md_to_pro.py",
+      "../scripts/ew_fetch.py",
+      "../scripts/create_pro_song.py",
+      "../scripts/parse_pro.py",
+      "../scripts/chord_grammar.json",
+      "python-runtime/README.md",
+      "python-runtime/aarch64/**/*",
+      "python-runtime/x86_64/**/*"
+    ]
+  }
+}

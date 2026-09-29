@@ -1,25 +1,37 @@
 {
-  "$schema": "https://schema.tauri.app/config/1",
+  "$schema": "https://schema.tauri.app/config/2",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "beforeBuildCommand": "pnpm build",
-    "devPath": "http://localhost:1420",
-    "distDir": "../dist"
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420"
   },
-  "package": {
-    "productName": "ChordPresenter",
-    "version": "1.2.0"
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": [
+      "../scripts/md_to_pro.py",
+      "../scripts/ew_fetch.py",
+      "../scripts/create_pro_song.py",
+      "../scripts/parse_pro.py",
+      "../scripts/chord_grammar.json"
+    ]
   },
-  "tauri": {
-    "allowlist": {
-      "all": false,
-      "shell": { "all": false, "open": true },
-      "dialog": { "all": false, "open": true },
-      "fs": {
-        "all": false,
-        "readFile": false,
-        "scope": ["$HOME/**", "$APPDATA/**", "$LOG/**"]
-      }
+  "productName": "ChordPresenter",
+  "mainBinaryName": "ChordPresenter",
+  "version": "1.2.0",
+  "identifier": "com.chordpresenter.app",
+  "plugins": {},
+  "app": {
+    "security": {
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"
     },
     "windows": [
       {
@@ -29,33 +41,10 @@
         "minWidth": 600,
         "minHeight": 680,
         "resizable": true,
-        "fileDropEnabled": true
+        "useHttpsScheme": true,
+        "label": "main",
+        "dragDropEnabled": true
       }
-    ],
-    "security": {
-      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"
-    },
-    "bundle": {
-      "active": true,
-      "targets": "all",
-      "identifier": "com.chordpresenter.app",
-      "resources": [
-        "../scripts/md_to_pro.py",
-        "../scripts/ew_fetch.py",
-        "../scripts/create_pro_song.py",
-        "../scripts/parse_pro.py",
-        "../scripts/chord_grammar.json",
-        "python-runtime/README.md",
-        "python-runtime/aarch64/**/*",
-        "python-runtime/x86_64/**/*"
-      ],
-      "icon": [
-        "icons/32x32.png",
-        "icons/128x128.png",
-        "icons/128x128@2x.png",
-        "icons/icon.icns",
-        "icons/icon.ico"
-      ]
-    }
+    ]
   }
 }

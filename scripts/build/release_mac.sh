@@ -12,7 +12,8 @@ cd "$ROOT"
 
 # rustup's toolchain has the aarch64 target; Homebrew's Rust (if installed) doesn't.
 export PATH="$HOME/.cargo/bin:$PATH"
-VERSION="$(python3 -c "import json;print(json.load(open('src-tauri/tauri.conf.json'))['package']['version'])")"
+# Tauri 2 keeps the version at the top level of tauri.conf.json (Tauri 1: package.version).
+VERSION="$(python3 -c "import json;c=json.load(open('src-tauri/tauri.conf.json'));print(c.get('version') or c['package']['version'])")"
 
 echo "▸ Tests"
 python3 -m unittest discover tests

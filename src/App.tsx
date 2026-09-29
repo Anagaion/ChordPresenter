@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback } from "react";
-import { invoke } from "@tauri-apps/api/tauri";
-import { open } from "@tauri-apps/api/dialog";
+import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
-import { open as openUrl } from "@tauri-apps/api/shell";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import "./App.css";
 import {
   MAJOR_KEYS, MINOR_KEYS, analyzeKey, prefersFlats,
@@ -300,12 +301,17 @@ export default function App() {
     }
   }, []);
 
-  // Tauri file-drop events — handles both .md and .pro
+  // Drag-and-drop of .md and .pro files onto the window (Tauri 2 webview
+  // drag-drop events: enter/over → highlight, drop → load, leave → reset).
   useEffect(() => {
-    const p1 = listen<string[]>("tauri://file-drop", e => {
-      const pro = e.payload.find(f => f.endsWith(".pro"));
-      const md  = e.payload.find(f => f.endsWith(".md"));
+    const unlisten = getCurrentWebview().onDragDropEvent(e => {
+      const { type } = e.payload;
+      if (type === "enter" || type === "over") { setIsDragging(true); return; }
       setIsDragging(false);
+      if (type !== "drop") return;
+      const paths = e.payload.paths;
+      const pro = paths.find(f => f.toLowerCase().endsWith(".pro"));
+      const md  = paths.find(f => f.toLowerCase().endsWith(".md"));
       if (pro) {
         loadProFile(pro);
       } else if (md) {
@@ -313,9 +319,7 @@ export default function App() {
         setMode("file");
       }
     });
-    const p2 = listen("tauri://file-drop-hover",     () => setIsDragging(true));
-    const p3 = listen("tauri://file-drop-cancelled", () => setIsDragging(false));
-    return () => { p1.then(f=>f()); p2.then(f=>f()); p3.then(f=>f()); };
+    return () => { unlisten.then(f => f()); };
   }, [loadFile, loadProFile]);
 
   const browseFile = useCallback(async () => {

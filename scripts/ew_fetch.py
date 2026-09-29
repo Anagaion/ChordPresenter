@@ -918,7 +918,10 @@ def generate_pro(title: str, artist: str, chart_text: str,
         if lyrics_only:
             cmd += ['--lyrics-only']
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        # UTF-8 both ways — the builder prints "→" and song titles, and Windows
+        # would otherwise use its legacy console encoding.
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8',
+                                env={**os.environ, 'PYTHONIOENCODING': 'utf-8'})
         if result.stdout:
             print(result.stdout, end='')
         if result.returncode != 0:

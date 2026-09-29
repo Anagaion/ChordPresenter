@@ -1,16 +1,19 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use chrono::Local;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
-use chrono::Local;
-use tauri::{CustomMenuItem, Manager, Menu, MenuItem, Submenu};
+use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
+use tauri::path::BaseDirectory;
+use tauri::{Emitter, Manager};
+use tauri_plugin_opener::OpenerExt;
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 
 fn log_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
-    let dir = app.path_resolver().app_log_dir()?;
+    let dir = app.path().app_log_dir().ok()?;
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }
@@ -110,7 +113,7 @@ fn save_config(output_dir: String) -> Result<(), String> {
 ///   i.e. the live source files in ChordPresenter/scripts/ — no copy needed.
 ///
 /// Production (`pnpm tauri build`):
-///   Uses app.path_resolver().resolve_resource() which maps to
+///   Uses app.path().resolve(.., BaseDirectory::Resource) which maps to
 ///   <App>.app/Contents/Resources/<name> — the bundled copies.
 fn script_path(app: &tauri::AppHandle, name: &str) -> Result<String, String> {
     #[cfg(debug_assertions)]
@@ -134,8 +137,10 @@ fn script_path(app: &tauri::AppHandle, name: &str) -> Result<String, String> {
     // In the production bundle, resources declared as "../scripts/foo.py" are stored
     // under Contents/Resources/_up_/scripts/foo.py (Tauri maps ".." → "_up_").
     let bundled = format!("_up_/scripts/{}", name);
-    app.path_resolver()
-        .resolve_resource(&bundled)
+    app.path()
+        .resolve(&bundled, BaseDirectory::Resource)
+        .ok()
+        .filter(|p| p.exists())
         .map(|p| p.to_string_lossy().to_string())
         .ok_or_else(|| format!("Bundled script not found: {}", bundled))
 }
@@ -155,7 +160,11 @@ fn python_command(app: &tauri::AppHandle) -> Command {
         Some(p).filter(|p| p.exists())
     };
     #[cfg(not(debug_assertions))]
-    let bundled = app.path_resolver().resolve_resource(&rel).filter(|p| p.exists());
+    let bundled = app
+        .path()
+        .resolve(&rel, BaseDirectory::Resource)
+        .ok()
+        .filter(|p| p.exists());
 
     match bundled {
         Some(python) => {
@@ -167,12 +176,21 @@ fn python_command(app: &tauri::AppHandle) -> Command {
             cmd.env_remove("PYTHONHOME")
                 .env_remove("PYTHONPATH")
                 .env("PYTHONNOUSERSITE", "1")
-                .env("PYTHONDONTWRITEBYTECODE", "1");
+                .env("PYTHONDONTWRITEBYTECODE", "1")
+                // UTF-8 output everywhere (Windows consoles default to cp1252,
+                // which can't encode the "→" in status lines).
+                .env("PYTHONIOENCODING", "utf-8");
             cmd
         }
         None => {
-            log(app, "PYTHON", "bundled runtime not found — using system python3");
-            Command::new("python3")
+            log(
+                app,
+                "PYTHON",
+                "bundled runtime not found — using system python3",
+            );
+            let mut cmd = Command::new("python3");
+            cmd.env("PYTHONIOENCODING", "utf-8");
+            cmd
         }
     }
 }
@@ -194,8 +212,8 @@ fn run_python(app: &tauri::AppHandle, mut cmd: Command, label: &str) -> Result<S
     })?;
 
     let result = RunResult {
-        stdout:  String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr:  String::from_utf8_lossy(&output.stderr).to_string(),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         success: output.status.success(),
     };
 
@@ -203,13 +221,21 @@ fn run_python(app: &tauri::AppHandle, mut cmd: Command, label: &str) -> Result<S
         log(app, "OUT", result.stdout.trim());
     }
     if !result.stderr.trim().is_empty() {
-        log(app, if result.success { "WARN" } else { "ERROR" }, result.stderr.trim());
+        log(
+            app,
+            if result.success { "WARN" } else { "ERROR" },
+            result.stderr.trim(),
+        );
     }
 
     if result.success {
         Ok(result.stdout)
     } else {
-        Err(format!("{}\n{}", result.stderr.trim(), result.stdout.trim()))
+        Err(format!(
+            "{}\n{}",
+            result.stderr.trim(),
+            result.stdout.trim()
+        ))
     }
 }
 
@@ -229,7 +255,9 @@ fn run_conversion(
 
     if let Some(ref key) = target_key {
         let k = key.trim();
-        if !k.is_empty() { cmd.arg("--key").arg(k); }
+        if !k.is_empty() {
+            cmd.arg("--key").arg(k);
+        }
     }
     if !output_dir.trim().is_empty() {
         cmd.arg("--out").arg(output_dir.trim());
@@ -247,7 +275,9 @@ fn read_file(path: String) -> Result<String, String> {
     if !p.is_absolute() {
         return Err("Path must be absolute".into());
     }
-    let canonical = p.canonicalize().map_err(|e| format!("Invalid path: {}", e))?;
+    let canonical = p
+        .canonicalize()
+        .map_err(|e| format!("Invalid path: {}", e))?;
     let home = std::env::var("HOME").unwrap_or_default();
     if home.is_empty() || !canonical.starts_with(&home) {
         return Err("Path is outside the home directory".into());
@@ -264,8 +294,7 @@ fn fetch_ew_preview(app: tauri::AppHandle, url: String) -> Result<String, String
     let script = script_path(&app, "ew_fetch.py")?;
     let mut cmd = python_command(&app);
     cmd.arg(&script).arg("--url").arg(u).arg("--preview");
-    run_python(&app, cmd, "fetch_ew_preview")
-        .map(|s| s.trim().to_string())
+    run_python(&app, cmd, "fetch_ew_preview").map(|s| s.trim().to_string())
 }
 
 #[tauri::command]
@@ -293,20 +322,29 @@ fn generate_from_url(
     let script = script_path(&app, "ew_fetch.py")?;
     let mut cmd = python_command(&app);
     cmd.arg(&script)
-        .arg("--chart-file").arg(&tmp_path)
-        .arg("--title").arg(&title)
-        .arg("--artist").arg(&artist);
+        .arg("--chart-file")
+        .arg(&tmp_path)
+        .arg("--title")
+        .arg(&title)
+        .arg("--artist")
+        .arg(&artist);
 
     if let Some(ref key) = target_key {
         let k = key.trim();
-        if !k.is_empty() { cmd.arg("--key").arg(k); }
+        if !k.is_empty() {
+            cmd.arg("--key").arg(k);
+        }
     }
     if let Some(ref key) = source_key {
         let k = key.trim();
-        if !k.is_empty() { cmd.arg("--source-key").arg(k); }
+        if !k.is_empty() {
+            cmd.arg("--source-key").arg(k);
+        }
     }
     if let Some(c) = capo {
-        if c > 0 && c < 12 { cmd.arg("--capo").arg(c.to_string()); }
+        if c > 0 && c < 12 {
+            cmd.arg("--capo").arg(c.to_string());
+        }
     }
     if !output_dir.trim().is_empty() {
         cmd.arg("--out").arg(output_dir.trim());
@@ -329,12 +367,26 @@ fn open_print_view(app: tauri::AppHandle, title: String, html: String) -> Result
     std::fs::create_dir_all(&dir).map_err(|e| format!("Could not create print folder: {}", e))?;
     let safe: String = title
         .chars()
-        .map(|c| if c.is_alphanumeric() || " -_()#".contains(c) { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || " -_()#".contains(c) {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
-    let name = if safe.trim().is_empty() { "Chart".to_string() } else { safe.trim().to_string() };
+    let name = if safe.trim().is_empty() {
+        "Chart".to_string()
+    } else {
+        safe.trim().to_string()
+    };
     let path = dir.join(format!("{}.html", name));
     std::fs::write(&path, html).map_err(|e| format!("Could not write print file: {}", e))?;
-    log(&app, "print", &format!("Opening print view: {}", path.display()));
+    log(
+        &app,
+        "print",
+        &format!("Opening print view: {}", path.display()),
+    );
     Command::new("open")
         .arg(&path)
         .spawn()
@@ -348,79 +400,73 @@ fn parse_pro(app: tauri::AppHandle, pro_path: String) -> Result<String, String> 
     if !p.is_absolute() {
         return Err("Path must be absolute".into());
     }
-    let canonical = p.canonicalize().map_err(|e| format!("Invalid path: {}", e))?;
+    let canonical = p
+        .canonicalize()
+        .map_err(|e| format!("Invalid path: {}", e))?;
     if !canonical.exists() {
         return Err(format!("File not found: {}", pro_path));
     }
     let script = script_path(&app, "parse_pro.py")?;
     let mut cmd = python_command(&app);
-    cmd.arg(&script).arg(canonical.to_string_lossy().to_string());
-    run_python(&app, cmd, "parse_pro")
-        .map(|s| s.trim().to_string())
+    cmd.arg(&script)
+        .arg(canonical.to_string_lossy().to_string());
+    run_python(&app, cmd, "parse_pro").map(|s| s.trim().to_string())
 }
 
 // ── Menu ──────────────────────────────────────────────────────────────────────
 
-fn create_menu() -> Menu {
-    let preferences = CustomMenuItem::new("preferences", "Preferences…")
-        .accelerator("CmdOrCtrl+,");
-    let open_log = CustomMenuItem::new("open_log", "Open Log File");
+/// App menu: Preferences, Open Log File, and the standard edit commands (so
+/// ⌘C/⌘V work in text fields). Hide/Hide Others/Show All are macOS-only.
+fn build_menu(app: &tauri::App) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    let preferences = MenuItemBuilder::with_id("preferences", "Preferences…")
+        .accelerator("CmdOrCtrl+,")
+        .build(app)?;
+    let open_log = MenuItemBuilder::with_id("open_log", "Open Log File").build(app)?;
 
-    let app_menu = Submenu::new(
-        "ChordPresenter",
-        Menu::new()
-            .add_item(preferences)
-            .add_native_item(MenuItem::Separator)
-            .add_item(open_log)
-            .add_native_item(MenuItem::Separator)
-            .add_native_item(MenuItem::Hide)
-            .add_native_item(MenuItem::HideOthers)
-            .add_native_item(MenuItem::ShowAll)
-            .add_native_item(MenuItem::Separator)
-            .add_native_item(MenuItem::Quit),
-    );
+    let mut app_menu = SubmenuBuilder::new(app, "ChordPresenter")
+        .item(&preferences)
+        .separator()
+        .item(&open_log)
+        .separator();
+    #[cfg(target_os = "macos")]
+    {
+        app_menu = app_menu.hide().hide_others().show_all().separator();
+    }
+    let app_menu = app_menu.quit().build()?;
 
-    let edit_menu = Submenu::new(
-        "Edit",
-        Menu::new()
-            .add_native_item(MenuItem::Undo)
-            .add_native_item(MenuItem::Redo)
-            .add_native_item(MenuItem::Separator)
-            .add_native_item(MenuItem::Cut)
-            .add_native_item(MenuItem::Copy)
-            .add_native_item(MenuItem::Paste)
-            .add_native_item(MenuItem::SelectAll),
-    );
+    let edit_menu = SubmenuBuilder::new(app, "Edit")
+        .undo()
+        .redo()
+        .separator()
+        .cut()
+        .copy()
+        .paste()
+        .select_all()
+        .build()?;
 
-    Menu::new()
-        .add_submenu(app_menu)
-        .add_submenu(edit_menu)
+    MenuBuilder::new(app).items(&[&app_menu, &edit_menu]).build()
 }
 
 fn main() {
     tauri::Builder::default()
-        .menu(create_menu())
-        .on_menu_event(|event| {
-            match event.menu_item_id() {
-                "preferences" => {
-                    event.window().emit("open-preferences", ()).unwrap();
-                }
-                "open_log" => {
-                    let app = event.window().app_handle();
-                    if let Some(path) = log_path(&app) {
-                        // Create the file if it doesn't exist yet
-                        if !path.exists() {
-                            let _ = std::fs::write(&path, "");
-                        }
-                        tauri::api::shell::open(
-                            &app.shell_scope(),
-                            path.to_string_lossy().to_string(),
-                            None,
-                        ).ok();
-                    }
-                }
-                _ => {}
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "preferences" => {
+                let _ = app.emit("open-preferences", ());
             }
+            "open_log" => {
+                if let Some(path) = log_path(app) {
+                    // Create the file if it doesn't exist yet
+                    if !path.exists() {
+                        let _ = std::fs::write(&path, "");
+                    }
+                    let _ = app
+                        .opener()
+                        .open_path(path.to_string_lossy().to_string(), None::<&str>);
+                }
+            }
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             run_conversion,
@@ -436,12 +482,19 @@ fn main() {
             clear_log,
         ])
         .setup(|app| {
+            app.set_menu(build_menu(app)?)?;
             // Log startup
             let handle = app.handle();
-            log(&handle, "START", &format!(
-                "ChordPresenter started — log: {}",
-                log_path(&handle).map(|p| p.to_string_lossy().to_string()).unwrap_or_default()
-            ));
+            log(
+                &handle,
+                "START",
+                &format!(
+                    "ChordPresenter started — log: {}",
+                    log_path(&handle)
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                ),
+            );
             Ok(())
         })
         .run(tauri::generate_context!())

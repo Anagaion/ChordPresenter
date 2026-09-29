@@ -1,0 +1,87 @@
+# Build and test ChordPresenter on macOS and Windows for every push and pull
+# request. Each run uploads the built app so it can be downloaded and tried
+# from the run's "Artifacts" section — no release needed.
+name: Build
+
+on:
+  push:
+    branches: [main, "v*-dev"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS (universal)
+            os: macos-latest
+          - name: Windows
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24          # tests run .ts helpers directly (built-in type stripping)
+          cache: pnpm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install JavaScript dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Tests
+        # Site-fixture snapshots are local-only (copyrighted pages), so that
+        # suite skips here; the rule, parity and paste tests run everywhere.
+        run: python -m unittest discover tests -v
+
+      - name: Typecheck and build the interface
+        run: pnpm build
+
+      # ── macOS: the full release script (bundled Python, universal, signed .dmg) ──
+      - name: Build universal .dmg
+        if: matrix.os == 'macos-latest'
+        run: scripts/build/release_mac.sh
+
+      - name: Upload macOS build
+        if: matrix.os == 'macos-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChordPresenter-macOS
+          path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+
+      # ── Windows: installer build (Python not bundled yet — see v2.0 plan) ──
+      - name: Build Windows installer
+        if: matrix.os == 'windows-latest'
+        run: pnpm tauri build --bundles nsis
+
+      - name: Upload Windows build
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChordPresenter-Windows
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error

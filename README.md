@@ -1,5 +1,7 @@
 # ChordPresenter
 
+[![Build](https://github.com/Anagaion/ChordPresenter/actions/workflows/build.yml/badge.svg)](https://github.com/Anagaion/ChordPresenter/actions/workflows/build.yml)
+
 ChordPresenter was created to streamline the process of creating ProPresenter files that have embedded chord charts in them. While there are many online resources for finding chord charts for popular songs, there is no easy way to get those into your Stage Monitor on ProPresenter.
 
 I have spent years in tech and was not able to find a solution, so I decided to make one. This is a simple app built on [Tauri](https://tauri.app) for macOS. I may later add Windows support if there is interest.
@@ -55,7 +57,9 @@ The app isn't notarized by Apple yet, so the first time you open it:
 
 ## Build From Source
 
-Requires: Rust (via rustup), Node + pnpm, Xcode Command Line Tools, Python 3 (for development and tests). macOS only.
+Requires: Rust (via rustup), Node + pnpm, Xcode Command Line Tools, Python 3 (for development and tests). Built on [Tauri 2](https://tauri.app).
+
+Every push to `main` or a `v*-dev` branch is built and tested on **macOS and Windows** by GitHub Actions (`.github/workflows/build.yml`); the built app can be downloaded from the run's **Artifacts**. The Windows build doesn't bundle Python yet, so it can't convert songs until the v2.0 Rust rewrite.
 
 ```bash
 cd ChordPresenter
