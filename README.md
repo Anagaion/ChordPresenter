@@ -92,9 +92,25 @@ python3 -m unittest discover tests
 
 ---
 
-## Pending / Future
+## Planned development
 
-- **Rust rewrite (v2)**: move the Python pipeline into the app itself — smaller, faster, one implementation
-- **Windows support**: much simpler once the pipeline is in Rust
-- **Notarized releases**: no more "Open Anyway" step
-- **Additional site parsers**: Genius and AllChristianSongsLyrics need further testing
+### Version 2.0 (in progress)
+- **Built on Tauri 2**, with every change automatically built and tested on **macOS and Windows**.
+- **Rewrite the chart engine in Rust**, inside the app itself: smaller, faster, and one implementation instead of two. The song-page test suite makes sure every step produces the same `.pro` files as today.
+- **No Python at all.** The app gets smaller, with nothing extra bundled or installed.
+- **Windows version.** Beta testers wanted: if your church runs ProPresenter on Windows, keep an eye on the Releases page for a beta.
+- **ChordPro support**: work internally in the standard ChordPro format (`[G]Amazing [D]grace`), edit chords inline, and export `.cho` files for apps like OnSong.
+
+### Also planned
+- **Formatting guide built into the app**, so it works offline.
+- **Notarized releases**, so there's no more "Open Anyway" step.
+- **More sites:** better testing for the lyrics-only sites (Genius, AllChristianSongsLyrics).
+
+### Ideas being considered
+- **Planning Center Services import:** pull songs straight from a service plan. A community fork is experimenting with this already.
+
+---
+
+## Contributing
+
+Bug reports, song links that don't convert well, and pull requests are all welcome. Please open an [issue](https://github.com/Anagaion/ChordPresenter/issues). For conversion problems, include the song link and the log file (**ChordPresenter → Open Log File**).
