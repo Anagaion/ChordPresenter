@@ -39,7 +39,7 @@ Glory, glory to the King
 
 def paste_stage(text: str) -> dict:
     out = subprocess.run(['node', '--no-warnings', os.path.join(ROOT, 'tests', 'paste_stage.ts')],
-                         input=text, capture_output=True, text=True, check=True).stdout
+                         input=text, capture_output=True, text=True, encoding="utf-8", check=True, timeout=120).stdout
     return json.loads(out)
 
 

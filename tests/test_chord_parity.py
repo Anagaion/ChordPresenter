@@ -34,7 +34,7 @@ LINES = [
 def app_answers(tokens: list[str], lines: list[str]) -> dict:
     out = subprocess.run(['node', '--no-warnings', os.path.join(ROOT, 'tests', 'chord_parity.ts')],
                          input=json.dumps({'tokens': tokens, 'lines': lines}),
-                         capture_output=True, text=True, check=True).stdout
+                         capture_output=True, text=True, encoding="utf-8", check=True, timeout=120).stdout
     return json.loads(out)
 
 

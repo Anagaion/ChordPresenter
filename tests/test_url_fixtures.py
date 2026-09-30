@@ -50,7 +50,7 @@ def ui_stage(pages: list[dict]) -> list[dict]:
     stdin = ''.join(json.dumps({'key': p.get('key', ''), 'capo': p.get('capo'),
                                 'chart_text': p.get('chart_text', '')}) + '\n' for p in pages)
     out = subprocess.run(['node', '--no-warnings', os.path.join(ROOT, 'tests', 'ui_stage.ts')],
-                         input=stdin, capture_output=True, text=True, check=True).stdout
+                         input=stdin, capture_output=True, text=True, encoding="utf-8", check=True, timeout=120).stdout
     return [json.loads(l) for l in out.splitlines() if l.strip()]
 
 
