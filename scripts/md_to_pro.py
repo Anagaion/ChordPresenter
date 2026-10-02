@@ -955,9 +955,11 @@ def process_file(filepath: str, target_key: str = None, output_dir: str = None,
         )
     os.makedirs(out_dir, exist_ok=True)
 
-    # Single output file: "Title - Artist - Key.pro"  (or "Title - Key.pro" if no artist)
+    # Single output file: "Title - Artist - Key.pro"  (or "Title - Key.pro" if no artist).
+    # Lyrics-only slides carry no chords, so no key ("… - Unknown.pro" before).
     capo_tag    = f" (Capo {capo})" if capo else ""
-    file_name   = f"{display_name} - {key}{capo_tag}.pro"
+    key_tag     = "" if lyrics_only or not key or key == 'Unknown' else f" - {key}"
+    file_name   = f"{display_name}{key_tag}{capo_tag}.pro"
     file_path   = os.path.join(out_dir, file_name)
     song_data   = build_song_pro(display_name, artist, sections, chord_map,
                                   lyrics_only=lyrics_only, first_slide_notes=notes)

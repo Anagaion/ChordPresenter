@@ -655,6 +655,56 @@ def parse_ultimate_guitar(html: str) -> dict:
 
 # ── Genius.com ────────────────────────────────────────────────────────────────
 
+class _GeniusLyrics(HTMLParser):
+    """Text of every <div data-lyrics-container="true"> on a Genius page,
+    one string per block, with <br> as line breaks and anything marked
+    data-exclude-from-selection (headers, contributor counts) left out."""
+
+    VOID = {'br', 'img', 'hr', 'input', 'meta', 'link', 'wbr'}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.blocks, self._buf = [], []
+        self._depth = 0          # open elements inside the current lyrics block
+        self._skip = 0           # >0 while inside an excluded subtree
+
+    @classmethod
+    def extract(cls, html: str) -> list:
+        p = cls()
+        p.feed(html)
+        p.close()
+        return p.blocks
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if self._depth == 0:
+            if tag == 'div' and a.get('data-lyrics-container') == 'true':
+                self._depth, self._buf = 1, []
+            return
+        if tag == 'br':
+            if not self._skip:
+                self._buf.append('\n')
+            return
+        if tag in self.VOID:
+            return
+        self._depth += 1
+        if self._skip or a.get('data-exclude-from-selection') == 'true':
+            self._skip += 1
+
+    def handle_endtag(self, tag):
+        if self._depth == 0 or tag in self.VOID:
+            return
+        if self._skip:
+            self._skip -= 1
+        self._depth -= 1
+        if self._depth == 0:
+            self.blocks.append(''.join(self._buf))
+
+    def handle_data(self, data):
+        if self._depth and not self._skip:
+            self._buf.append(data)
+
+
 def parse_genius(html: str) -> dict:
     """
     Genius stores lyrics in one or more <div data-lyrics-container="true"> elements.
@@ -671,7 +721,10 @@ def parse_genius(html: str) -> dict:
         # Format: "Artist Name – Song Title Lyrics" or "Song Title by Artist Name"
         m = re.match(r'^(.*?)\s*[–-]\s*(.*?)\s*(?:Lyrics)?\s*$', ot)
         if m:
-            artist = m.group(1).strip()
+            # Drop featured-artist credits so file names stay readable:
+            # "Elevation Worship (Ft. Brandon Lake …)" → "Elevation Worship".
+            artist = re.sub(r'\s*\((?:ft|feat|featuring)\.?\s.*\)\s*$', '',
+                            m.group(1).strip(), flags=re.IGNORECASE)
             title  = re.sub(r'\s*Lyrics\s*$', '', m.group(2)).strip()
 
     if not title:
@@ -680,28 +733,22 @@ def parse_genius(html: str) -> dict:
 
     key = ''  # Genius is lyrics-only, no key info
 
-    # Find all lyrics containers
-    containers = re.findall(
-        r'<div[^>]+data-lyrics-container="true"[^>]*>(.*?)</div>',
-        html, re.DOTALL | re.IGNORECASE
-    )
-    if not containers:
-        # Fallback: look for a large div with class containing "Lyrics"
+    # Lyrics live in <div data-lyrics-container="true"> blocks, which contain
+    # nested elements — the first one opens with a header strip (title,
+    # contributors) marked data-exclude-from-selection. A "first </div>" regex
+    # stopped inside that header and lost everything after it (whole verses),
+    # so the blocks are read with a real parser that tracks nesting.
+    chart_lines = _GeniusLyrics.extract(html)
+    if not chart_lines:
+        # Fallback: older layout — a div with class containing "Lyrics"
         containers = re.findall(
             r'<div[^>]+class="[^"]*Lyrics[^"]*"[^>]*>(.*?)</div>',
             html, re.DOTALL | re.IGNORECASE
         )
-
-    chart_lines = []
-    for container in containers:
-        # Convert <br> to newlines
-        text = re.sub(r'<br\s*/?>', '\n', container, flags=re.IGNORECASE)
-        # Convert <h2>...</h2> section headers
-        text = re.sub(r'<h2[^>]*>(.*?)</h2>', lambda m: '\n' + _strip_html(m.group(1)).strip() + '\n', text, flags=re.DOTALL)
-        # Strip remaining HTML tags
-        text = re.sub(r'<[^>]+>', '', text)
-        text = html_mod.unescape(text)
-        chart_lines.append(text)
+        for container in containers:
+            text = re.sub(r'<br\s*/?>', '\n', container, flags=re.IGNORECASE)
+            text = re.sub(r'<[^>]+>', '', text)
+            chart_lines.append(html_mod.unescape(text))
 
     chart_text = '\n'.join(chart_lines).strip()
 
@@ -713,9 +760,10 @@ def parse_genius(html: str) -> dict:
         if not stripped:
             normalized.append('')
             continue
-        # Already a bracket header
+        # Already a bracket header. Genius adds singer credits —
+        # "[Chorus: Brandon Lake & Chandler Moore, Both]" → "[Chorus]".
         if re.match(r'^\[.*\]$', stripped):
-            normalized.append(stripped)
+            normalized.append('[' + stripped[1:-1].split(':')[0].strip() + ']')
             continue
         # Plain section name → wrap in brackets
         if SECTION_NAME_RE.match(stripped):
