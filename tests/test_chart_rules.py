@@ -109,6 +109,39 @@ class TabsAndDividers(unittest.TestCase):
         self.assertIn('```\n   G    C\n', md)
 
 
+class GeniusLyrics(unittest.TestCase):
+    # Shaped like a Genius page: the first lyrics block opens with a nested,
+    # excluded header strip; headers carry singer credits.
+    PAGE = ('<meta property="og:title" content="Test Choir (Ft. Guest Singer) – Morning Song Lyrics">'
+            '<div data-lyrics-container="true" class="Lyrics__Container">'
+            '<div data-exclude-from-selection="true"><div><h2>Morning Song Lyrics</h2></div>'
+            '<div><a><span>3 Contributors</span></a></div></div>'
+            '[Verse 1]<br/>Sing a new song<br/><a><span>Praise Him in the morning</span></a><br/><br/>'
+            '[Chorus: Test Choir &amp; Guest Singer]<br/>Glory to the King</div>'
+            '<div data-lyrics-container="true">[Bridge]<br/>Holy is the Lord</div>')
+
+    def test_nested_header_does_not_cut_lyrics(self):
+        d = ew_fetch.parse_genius(self.PAGE)
+        lines = [l for l in d['chart_text'].splitlines() if l.strip()]
+        self.assertEqual(lines, ['[Verse 1]', 'Sing a new song', 'Praise Him in the morning',
+                                 '[Chorus]', 'Glory to the King', '[Bridge]', 'Holy is the Lord'])
+
+    def test_title_and_artist(self):
+        d = ew_fetch.parse_genius(self.PAGE)
+        self.assertEqual((d['title'], d['artist'], d['lyrics_only']), ('Morning Song', 'Test Choir', True))
+
+    def test_lyrics_only_file_name_has_no_key(self):
+        d = ew_fetch.parse_genius(self.PAGE)
+        with tempfile.TemporaryDirectory() as tmp:
+            md = os.path.join(tmp, 'c.md')
+            with open(md, 'w', encoding='utf-8') as f:
+                f.write(ew_fetch.convert_chart_to_md(d['chart_text'], d['title'], d['artist']))
+            with contextlib.redirect_stdout(io.StringIO()):
+                md_to_pro.process_file(md, output_dir=tmp, lyrics_only=True)
+            self.assertEqual([n for n in os.listdir(tmp) if n.endswith('.pro')],
+                             ['Morning Song - Test Choir.pro'])
+
+
 class UltimateGuitarMarkers(unittest.TestCase):
     def _page(self, content):
         # The UG parser only takes "content" longer than 100 chars — pad it.
